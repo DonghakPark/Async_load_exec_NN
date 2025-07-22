@@ -40,3 +40,4 @@
 *.dwo
 .idea/
 *.bin
+buildDir/
