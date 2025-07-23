@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -9,7 +10,6 @@
 #include <cstring>
 #include <future>
 #include <iostream>
-#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -17,19 +17,15 @@
 #include <vector>
 
 const int NUM_LAYERS = 34;
-const int LOOK_AHEAD = 10;
+const int LOOK_AHEAD = 16;
 const double COMPUTE_TIME = 0.0023;
-const size_t LAYER_SIZE = (((3072 * 3072 * 2) + (3072 * 256 * 2) +
-                            (3072 * 8192 * 2) + (8192 * 8192)) *
-                           4);
-const size_t NUM_CHUNKS = 4;
+const size_t LAYER_SIZE = (((3072 * 3072 * 2) + (3072 * 256 * 2) + (3072 * 8192 * 2) + (8192 * 8192)) * 4/8);
+const size_t NUM_THREAD = 8;
 const std::string WEIGHTS_FILE = "./weights.bin";
 const size_t LAYER_BYTES = LAYER_SIZE;
 const size_t TOTAL_WEIGHTS_BYTES = LAYER_BYTES * NUM_LAYERS;
 std::vector<std::future<void>> load_futures;
 std::unordered_map<int, bool> load_status;
-
-std::mutex pool_mutex;
 
 std::vector<void *> memory_pool;
 std::vector<size_t> layer_offsets;
@@ -42,8 +38,6 @@ void preallocate_mem_pool() {
   for (unsigned int i = 0; i < NUM_LAYERS; i++) {
     void *ptr = aligned_alloc(4096, LAYER_SIZE);
     memory_pool.emplace_back(ptr);
-    std::cout << "Allocate Mem for [" << i << "] " << ptr
-              << " - size : " << LAYER_SIZE << std::endl;
   }
 }
 
@@ -55,24 +49,25 @@ bool is_layer_loaded(int layer_order) {
   return true;
 }
 
-void load_layer(int layer_id, int slot) {
+void load_layer(int layer_id) {
+  if (layer_id >= NUM_LAYERS) return;
+
   auto start = std::chrono::high_resolution_clock::now();
 
-  size_t chunk_size = LAYER_SIZE / NUM_CHUNKS;
+  size_t chunk_size = LAYER_SIZE / NUM_THREAD;
 
   std::vector<std::future<void>> chunk_futures;
-  size_t offset = layer_offsets[layer_id - 1];
+  size_t offset = layer_offsets[layer_id];
 
-  for (size_t idx = 0; idx < NUM_CHUNKS; ++idx) {
+  char *mapped_ptr = static_cast<char *>(mmap(nullptr, LAYER_SIZE, PROT_READ |O_DIRECT,
+                         MAP_PRIVATE | MAP_POPULATE, fd, offset));
+  for (size_t idx = 0; idx < NUM_THREAD; ++idx) {
     chunk_futures.push_back(std::async(
         std::launch::async,
         [&](size_t i) {
-          off_t chunk_start = static_cast<off_t>(offset + i * chunk_size);
-          std::vector<float> buffer(chunk_size);
-          ssize_t bytes_read = read(fd, buffer.data(), chunk_size);
+          off_t chunk_start = static_cast<off_t>(i * chunk_size);
           {
-            std::lock_guard<std::mutex> chunk_lock(pool_mutex);
-            std::memcpy(memory_pool[slot] + i * chunk_size, buffer.data(),
+            std::memcpy(memory_pool[layer_id] + (i * chunk_size), static_cast<void *>(mapped_ptr + chunk_start) ,
                         chunk_size);
           }
         },
@@ -84,11 +79,12 @@ void load_layer(int layer_id, int slot) {
 
   auto end = std::chrono::high_resolution_clock::now();
   double duration =
-
       std::chrono::duration<double, std::milli>(end - start).count();
   printf("Loaded Layer : %d, Time : %f ms\n", layer_id, duration);
 
   total_load_time += duration;
+
+  munmap(mapped_ptr, LAYER_SIZE);
 }
 
 void compute_layer(int layer_id) {
@@ -106,28 +102,27 @@ void compute_layer(int layer_id) {
 int main(int argc, char *argv[]) {
   auto program_start = std::chrono::high_resolution_clock::now();
 
-  fd = open(WEIGHTS_FILE.c_str(), O_RDONLY);
+  fd = open(WEIGHTS_FILE.c_str(), O_RDONLY|O_DIRECT);
   for (int i = 0; i < NUM_LAYERS; ++i) {
     layer_offsets.emplace_back(static_cast<size_t>(i) * LAYER_BYTES);
   }
 
   preallocate_mem_pool();
-  std::cout << "Allocate memmory Done " << std::endl;
+  std::cout << "Allocate memory Done " << std::endl;
 
   ////////////////////////////////////////////////////////////////////////////////////////////
   /// Forwarding Logic
   ///
 
   for (int i = 0; i < LOOK_AHEAD; ++i) {
-    load_futures.push_back(std::async(std::launch::async, load_layer, i, i));
+    load_futures.push_back(std::async(std::launch::async, load_layer, i));
   }  // Load Weight (0 ~ Look Ahead)
-  std::cout << "Pre Load Done " << std::endl;
 
   for (unsigned int order = 0; order < NUM_LAYERS; ++order) {
     is_layer_loaded(order);
     compute_layer(order);
     load_futures.push_back(
-        std::async(std::launch::async, load_layer, order + LOOK_AHEAD, order));
+    std::async(std::launch::async, load_layer, order + LOOK_AHEAD));
   }
 
   auto program_end = std::chrono::high_resolution_clock::now();
